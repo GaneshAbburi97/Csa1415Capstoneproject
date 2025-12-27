@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Expression DAG for Basic Block</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      display: flex;
+      height: 100vh;
+    }
+    #sidebar {
+      width: 300px;
+      padding: 12px;
+      border-right: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+    #cy {
+      flex: 1;
+      height: 100%;
+    }
+    textarea {
+      width: 100%;
+      height: 180px;
+      box-sizing: border-box;
+    }
+    button {
+      margin-top: 8px;
+      padding: 6px 10px;
+      width: 100%;
+    }
+    .note {
+      font-size: 13px;
+      margin-bottom: 6px;
+    }
+    label {
+      display: block;
+      margin-top: 8px;
+      font-size: 14px;
+    }
+  </style>
+
+  <!-- Cytoscape + dagre -->
+  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+</head>
+<body>
+<div id="sidebar">
+  <h3>Basic Block DAG</h3>
+  <div class="note">
+    Assignments like:<br>
+    <code>t1=-c</code><br>
+    <code>t2=b*t1</code><br>
+    <code>t3=-c</code><br>
+    <code>t4=b*t3</code><br>
+    <code>t5=t2+t4</code><br>
+    <code>a=t5</code><br>
+    Supported ops: <code>+ - * /</code>, unary <code>-</code>
+  </div>
+  <textarea id="inputBox">t1=-c
+t2=b*t1
+t3=-c
+t4=b*t3
+t5=t2+t4
+a=t5</textarea>
+  <button id="buildBtn">Build DAG</button>
+  <label>
+    <input type="checkbox" id="treeToggle">
+    Tree View (duplicate nodes)
+  </label>
+</div>
+
+<div id="cy"></div>
+
+<script>
+  cytoscape.use(cytoscapeDagre);
+
+  const cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: [],
+    style: [
+      {
+        selector: 'node[type="leaf"]',
+        style: {
+          'shape': 'round-rectangle',
+          'background-color': '#0074D9',
+          'label': 'data(label)',
+          'color': '#fff',
+          'text-valign': 'center',
+          'text-halign': 'center',
+          'font-size': 14,
+          'padding': '6px'
+        }
+      },
+      {
+        selector: 'node[type="op"]',
+        style: {
+          'shape': 'ellipse',
+          'background-color': '#FFDC00',
+          'label': 'data(label)',
+          'color': '#000',
+          'text-valign': 'center',
+          'text-halign': 'center',
+          'font-size': 14,
+          'padding': '6px',
+          'border-width': 1,
+          'border-color': '#333'
+        }
+      },
+      {
+        selector: 'node.reused',
+        style: {
+          'border-width': 4,
+          'border-color': '#FF851B',
+          'box-shadow': '0 0 12px #FF851B'
+        }
+      },
+      {
+        selector: 'edge',
+        style: {
+          'width': 2,
+          'curve-style': 'unbundled-bezier',
+          'control-point-distance': 40,
+          'control-point-weight': 0.5,
+          'target-arrow-shape': 'triangle',
+          'target-arrow-color': '#555',
+          'line-color': '#555'
+        }
+      }
+    ],
+    layout: { name: 'dagre' }
+  });
+
+  // Parse lines: binary x=y op z  OR unary x=-y
+  function parseAssignments(text) {
+    return text
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(Boolean)
+      .map(line => {
+        const cleaned = line.replace(/\s+/g, '');
+        // binary: x=y op z
+        let m = cleaned.match(
+          /^([a-zA-Z]\w*)=([a-zA-Z]\w*)([\+\-\*\/])([a-zA-Z]\w*)$/
+        );
+        if (m) {
+          return {
+            kind: 'bin',
+            lhs: m[1],
+            y: m[2],
+            op: m[3],
+            z: m[4]
+          };
+        }
+        // unary minus: x=-y
+        m = cleaned.match(/^([a-zA-Z]\w*)=-(\w+)$/);
+        if (m) {
+          return {
+            kind: 'un',
+            lhs: m[1],
+            op: 'uminus',
+            y: m[2]
+          };
+        }
+        return null;
+      })
+      .filter(Boolean);
+  }
+
+  function buildExpressionDAG(assignments) {
+    cy.elements().remove();
+
+    let nextId = 0;
+    const nodeForName = new Map();     // variable name -> node id
+    const opNodeForKey = new Map();    // binary key -> node id
+    const unOpNodeForKey = new Map();  // unary key -> node id
+    const labelsForOpNode = new Map(); // node id -> Set of variable names
+
+    const newNodeId = () => 'n' + (nextId++);
+
+    function ensureNameNode(name) {
+      if (nodeForName.has(name)) return nodeForName.get(name);
+      const id = newNodeId();
+      nodeForName.set(name, id);
+      cy.add({
+        group: 'nodes',
+        data: { id, type: 'leaf', label: name }
+      });
+      return id;
+    }
+
+    function getBinOpNode(op, leftId, rightId) {
+      const key = op + '|' + leftId + '|' + rightId;
+      const treeMode = document.getElementById('treeToggle').checked;
+      if (!treeMode && opNodeForKey.has(key)) {
+        return opNodeForKey.get(key);
+      }
+      const id = newNodeId();
+      opNodeForKey.set(key, id);
+      labelsForOpNode.set(id, new Set());
+      cy.add({
+        group: 'nodes',
+        data: { id, type: 'op', op, label: op }
+      });
+      cy.add({
+        group: 'edges',
+        data: { id: 'e' + newNodeId(), source: leftId, target: id }
+      });
+      cy.add({
+        group: 'edges',
+        data: { id: 'e' + newNodeId(), source: rightId, target: id }
+      });
+      return id;
+    }
+
+    function getUnOpNode(op, childId) {
+      const key = op + '|' + childId;
+      const treeMode = document.getElementById('treeToggle').checked;
+      if (!treeMode && unOpNodeForKey.has(key)) {
+        return unOpNodeForKey.get(key);
+      }
+      const id = newNodeId();
+      unOpNodeForKey.set(key, id);
+      labelsForOpNode.set(id, new Set());
+      const label = op === 'uminus' ? '-' : op;
+      cy.add({
+        group: 'nodes',
+        data: { id, type: 'op', op, label }
+      });
+      cy.add({
+        group: 'edges',
+        data: { id: 'e' + newNodeId(), source: childId, target: id }
+      });
+      return id;
+    }
+
+    // Build DAG
+    for (const stmt of assignments) {
+      if (stmt.kind === 'bin') {
+        const yNode = ensureNameNode(stmt.y);
+        const zNode = ensureNameNode(stmt.z);
+        const opNode = getBinOpNode(stmt.op, yNode, zNode);
+        nodeForName.set(stmt.lhs, opNode);
+        labelsForOpNode.get(opNode).add(stmt.lhs);
+      } else if (stmt.kind === 'un') {
+        const yNode = ensureNameNode(stmt.y);
+        const opNode = getUnOpNode(stmt.op, yNode);
+        nodeForName.set(stmt.lhs, opNode);
+        labelsForOpNode.get(opNode).add(stmt.lhs);
+      }
+    }
+
+    // Final labels + reuse highlighting
+    labelsForOpNode.forEach((vars, nodeId) => {
+      const node = cy.getElementById(nodeId);
+      const op = node.data('op');
+      const labelBase = op === 'uminus' ? '-' : op;
+      const varList = Array.from(vars).join(',');
+      node.data(
+        'label',
+        labelBase + ' (' + varList + ') ×' + vars.size
+      );
+      if (vars.size > 1) {
+        node.addClass('reused');
+      }
+    });
+
+    cy.layout({
+      name: 'dagre',
+      rankDir: 'TB',
+      nodeSep: 40,
+      rankSep: 70
+    }).run();
+  }
+
+  document.getElementById('buildBtn').onclick = () => {
+    const stmts = parseAssignments(
+      document.getElementById('inputBox').value
+    );
+    if (!stmts.length) {
+      alert('Use format: x=y+z or x=-y');
+      return;
+    }
+    buildExpressionDAG(stmts);
+  };
+
+  // Initial render
+  buildExpressionDAG(parseAssignments(document.getElementById('inputBox').value));
+</script>
+</body>
+</html>
